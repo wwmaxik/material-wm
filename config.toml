@@ -1,0 +1,18 @@
+# material-wm configuration file
+
+terminal = "kitty"
+bar_height = 32
+inner_gap = 8
+outer_gap = 12
+master_ratio = 0.55
+wallpaper_path = "~/Изображения/wallpapers/mashina4k.jpg"
+
+[theme]
+primary = "#D0BCFF"
+on_primary = "#381E72"
+surface = "#141218"
+surface_container = "#211F26"
+surface_container_high = "#2B2930"
+outline = "#938F99"
+outline_variant = "#49454F"
+error = "#F2B8B5"
