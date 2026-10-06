@@ -1,329 +1,405 @@
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::time::Instant;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::mem;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
-use smithay::backend::input::{
-    Event, InputEvent, KeyboardKeyEvent, PointerButtonEvent,
-};
+use anyhow::Context as _;
+use niri_config::{Config, OutputName};
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::drm::DrmNode;
+use smithay::backend::egl::EGLDevice;
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
-use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget};
-use smithay::backend::winit::{self, WinitEvent};
-use smithay::reexports::calloop::EventLoop;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::Display;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
-use smithay::wayland::compositor::{with_surface_tree_downward, SurfaceAttributes, TraversalAction};
-use smithay::wayland::seat::WaylandFocus;
-use smithay::reexports::winit::platform::pump_events::PumpStatus;
-use wayland_server::ListeningSocket;
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::{DebugFlags, ImportDma, ImportEgl, Renderer};
+use smithay::backend::winit::{self, WinitEvent, WinitGraphicsBackend};
+use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::reexports::calloop::LoopHandle;
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+use smithay::reexports::winit::dpi::LogicalSize;
+use smithay::reexports::winit::platform::wayland::WindowAttributesWayland;
+use smithay::reexports::winit::window::WindowAttributes;
+use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal};
+use smithay::wayland::presentation::Refresh;
 
-use crate::config::Config;
-use crate::state::{ClientState, MaterialRenderElement, MaterialWmState};
+use super::{IpcOutputMap, OutputId, RenderResult};
+use crate::niri::{Niri, RedrawState, State};
+use crate::render_helpers::debug::draw_damage;
+use crate::render_helpers::{resources, shaders, RenderCtx, RenderTarget};
+use crate::utils::{get_monotonic_time, logical_output, WinitScale};
 
-pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let mut event_loop: EventLoop<MaterialWmState> = EventLoop::try_new()?;
-    let mut display: Display<MaterialWmState> = Display::new()?;
-    let dh = display.handle();
+pub struct Winit {
+    config: Rc<RefCell<Config>>,
+    output: Output,
+    backend: WinitGraphicsBackend<GlesRenderer>,
+    damage_tracker: OutputDamageTracker,
+    render_node: Option<DrmNode>,
+    dmabuf_global: Option<DmabufGlobal>,
+    #[cfg(feature = "xdp-gnome-screencast")]
+    gbm_device: Option<smithay::backend::allocator::gbm::GbmDevice<smithay::utils::DeviceFd>>,
+    ipc_outputs: Arc<Mutex<IpcOutputMap>>,
+}
 
-    let mut state = MaterialWmState::new(dh.clone(), config);
+impl Winit {
+    pub fn new(
+        config: Rc<RefCell<Config>>,
+        event_loop: LoopHandle<State>,
+    ) -> Result<Self, winit::Error> {
+        let _span = tracy_client::span!("Winit::new");
 
-    let (mut backend, mut winit_event_loop) = winit::init::<GlesRenderer>()?;
-    backend.window().set_title("material-wm (Material You Desktop)");
+        let builder = WindowAttributes::default()
+            .with_surface_size(LogicalSize::new(1280.0, 800.0))
+            // .with_resizable(false)
+            .with_title("niri")
+            .with_platform_attributes(Box::new(
+                WindowAttributesWayland::default().with_name("niri", ""),
+            ));
+        let (backend, winit) = winit::init_from_attributes(builder)?;
 
-    let win_size = backend.window_size();
-    let logical_size = Size::from((win_size.w as i32, win_size.h as i32));
-    state.screen_size = logical_size;
-    state.gesture_tracker.screen_width = logical_size.w;
-
-    let mut damage_tracker = OutputDamageTracker::new(win_size, 1.0, Transform::Normal);
-
-    let auto_screenshot = std::env::var("MATERIAL_WM_AUTOSCREENSHOT").is_ok();
-    let mut screenshot_step: u32 = 0;
-
-    // Initialize Material You GLES SDF shaders on the backend renderer
-    {
-        let (renderer, _) = backend.bind()?;
-        state.ui.init_shaders(renderer);
-    }
-
-    let listener = ListeningSocket::bind_auto("wayland", 1..32)?;
-    let socket_name = listener
-        .socket_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "wayland-1".to_string());
-    std::env::set_var("WAYLAND_DISPLAY", &socket_name);
-    tracing::info!("material-wm listening on WAYLAND_DISPLAY={}", socket_name);
-
-    while state.running.load(Ordering::SeqCst) {
-        let now = Instant::now();
-        state.tick(now);
-
-        let pump_status = winit_event_loop.dispatch_new_events(|event| match event {
-            WinitEvent::Resized { size, .. } => {
-                let logical = Size::from((size.w as i32, size.h as i32));
-                state.screen_size = logical;
-                state.gesture_tracker.screen_width = logical.w;
-                damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
-                state.needs_redraw = true;
-            }
-            WinitEvent::Input(input_event) => match input_event {
-                InputEvent::Keyboard { event } => {
-                    let keycode = event.key_code();
-                    let key_state = event.state();
-                    let time = event.time_msec();
-                    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                    state.on_keyboard_key(keycode.into(), key_state, serial, time);
-                }
-                InputEvent::PointerMotionAbsolute { event } => {
-                    let screen_size = state.screen_size;
-                    let pos = smithay::backend::input::AbsolutePositionEvent::position_transformed(&event, screen_size);
-                    let time = event.time_msec();
-                    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                    state.on_pointer_motion(pos, serial, time);
-                }
-                InputEvent::PointerButton { event } => {
-                    let button = event.button_code();
-                    let btn_state = event.state();
-                    let time = event.time_msec();
-                    let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-                    state.on_pointer_button(button, btn_state, serial, time);
-                }
-                InputEvent::PointerAxis { event } => {
-                    let v_scroll = smithay::backend::input::PointerAxisEvent::amount(&event, smithay::backend::input::Axis::Vertical)
-                        .or_else(|| smithay::backend::input::PointerAxisEvent::amount_v120(&event, smithay::backend::input::Axis::Vertical))
-                        .unwrap_or(0.0);
-                    let h_scroll = smithay::backend::input::PointerAxisEvent::amount(&event, smithay::backend::input::Axis::Horizontal)
-                        .or_else(|| smithay::backend::input::PointerAxisEvent::amount_v120(&event, smithay::backend::input::Axis::Horizontal))
-                        .unwrap_or(0.0);
-                    let time = event.time_msec();
-                    state.on_pointer_axis(h_scroll, v_scroll, time);
-                }
-                _ => {}
+        let output = Output::new(
+            "winit".to_string(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Smithay".into(),
+                model: "Winit".into(),
+                serial_number: "Unknown".into(),
             },
-            WinitEvent::Redraw => {
-                state.needs_redraw = true;
-            }
-            _ => {}
+        );
+
+        let mode = Mode {
+            size: backend.window_size(),
+            refresh: 60_000,
+        };
+        output.change_current_state(Some(mode), None, None, None);
+        output.set_preferred(mode);
+
+        output.user_data().insert_if_missing(|| OutputName {
+            connector: "winit".to_string(),
+            make: Some("Smithay".to_string()),
+            model: Some("Winit".to_string()),
+            serial: None,
         });
 
-        match pump_status {
-            PumpStatus::Continue => (),
-            PumpStatus::Exit(_) => break,
-        }
+        output
+            .user_data()
+            .insert_if_missing(|| WinitScale(Cell::new(backend.scale_factor())));
 
-        // Check for new clients connecting
-        if let Some(stream) = listener.accept()? {
-            tracing::info!("Accepted new Wayland client");
-            let _ = display.handle().insert_client(stream, Arc::new(ClientState::default()));
-        }
+        let physical_properties = output.physical_properties();
+        let ipc_outputs = Arc::new(Mutex::new(HashMap::from([(
+            OutputId::next(),
+            niri_ipc::Output {
+                name: output.name(),
+                make: physical_properties.make,
+                model: physical_properties.model,
+                serial: None,
+                physical_size: None,
+                modes: vec![niri_ipc::Mode {
+                    width: backend.window_size().w.clamp(0, u16::MAX as i32) as u16,
+                    height: backend.window_size().h.clamp(0, u16::MAX as i32) as u16,
+                    refresh_rate: 60_000,
+                    is_preferred: true,
+                }],
+                current_mode: Some(0),
+                is_custom_mode: true,
+                vrr_supported: false,
+                vrr_enabled: false,
+                logical: Some(logical_output(&output)),
+                max_bpc: None,
+            },
+        )])));
 
-        // Render Frame with Damage Tracking
-        if state.needs_redraw {
-            state.needs_redraw = false;
+        let damage_tracker = OutputDamageTracker::from_output(&output);
 
-            let damage_to_submit = {
-                let (renderer, mut framebuffer) = backend.bind()?;
-                let screen_size = state.screen_size;
+        event_loop
+            .insert_source(winit, move |event, _, state| match event {
+                WinitEvent::Resized { size, scale_factor } => {
+                    let winit = state.backend.winit();
+                    let output = winit.output.clone();
+                    output.change_current_state(
+                        Some(Mode {
+                            size,
+                            refresh: 60_000,
+                        }),
+                        None,
+                        None,
+                        None,
+                    );
 
-                let mut render_elements: Vec<MaterialRenderElement> = Vec::new();
-
-                // 1. APPLICATION LAUNCHER (Topmost modal layer when open)
-                if state.ui.launcher.is_open || state.ui.launcher.open_progress.value() > 0.01 {
-                    if let Some(text_elem) = state.ui.render_launcher_text(renderer, screen_size) {
-                        render_elements.push(MaterialRenderElement::Memory(text_elem));
+                    {
+                        let scale = output.user_data().get_or_insert(WinitScale::default);
+                        scale.0.set(scale_factor);
                     }
-                    for elem in state.ui.render_launcher_shaders(screen_size) {
-                        render_elements.push(MaterialRenderElement::Shader(elem));
+
+                    {
+                        let mut ipc_outputs = winit.ipc_outputs.lock().unwrap();
+                        let output = ipc_outputs.values_mut().next().unwrap();
+                        let mode = &mut output.modes[0];
+                        mode.width = size.w.clamp(0, u16::MAX as i32) as u16;
+                        mode.height = size.h.clamp(0, u16::MAX as i32) as u16;
+                        state.niri.ipc_outputs_changed = true;
                     }
+
+                    state.reload_output_config();
+
+                    // reload_output_config() will call output_resized() for scale changes,
+                    // but not for size-only changes. Even if this is the second call, it's fine.
+                    state.niri.output_resized(&output);
                 }
+                WinitEvent::Input(event) => state.process_input_event(event),
+                WinitEvent::Focus(_) => (),
+                WinitEvent::Redraw => state.niri.queue_redraw(&state.backend.winit().output),
+                WinitEvent::CloseRequested => state.niri.stop_signal.stop(),
+            })
+            .unwrap();
 
-                // 2. QUICK SETTINGS DRAWER (Drawer overlay layer when open)
-                if state.ui.drawer.is_open || state.ui.drawer.open_progress.value() > 0.01 {
-                    if let Some(drawer_text) = state.ui.render_drawer_text(renderer, screen_size) {
-                        render_elements.push(MaterialRenderElement::Memory(drawer_text));
-                    }
-                    for elem in state.ui.render_drawer_shaders(screen_size) {
-                        render_elements.push(MaterialRenderElement::Shader(elem));
-                    }
-                }
-
-                // 3. TOP STATUS BAR (Bar text on top of bar shaders)
-                let active_ws = state.workspaces.active_workspace();
-                let focused = active_ws.focused_window.clone();
-                let active_title = focused.as_ref().and_then(|w| {
-                    w.wl_surface().and_then(|s| {
-                        smithay::wayland::compositor::with_states(&s, |states| {
-                            states.data_map.get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
-                                .and_then(|d| d.lock().ok())
-                                .and_then(|role| role.title.clone().or_else(|| role.app_id.clone()))
-                        })
-                    })
-                });
-
-                if let Some(bar_text) = state.ui.render_bar_text(renderer, screen_size, active_ws.id, active_title.as_deref()) {
-                    render_elements.push(MaterialRenderElement::Memory(bar_text));
-                }
-                for elem in state.ui.render_bar_shaders(screen_size) {
-                    render_elements.push(MaterialRenderElement::Shader(elem));
-                }
-
-                // 4. CLIENT WINDOWS (Front-to-back: focused window first)
-                for w in state.space.elements().rev() {
-                    if !active_ws.windows.contains(w) {
-                        continue;
-                    }
-                    let rect = state.space.element_bbox(w).unwrap_or_else(|| {
-                        Rectangle::new(Point::from((0, 0)), (800, 600).into())
-                    });
-                    let is_focused = focused.as_ref() == Some(w);
-
-                    if let Some(border) = state.ui.render_window_border(rect, is_focused, 1.0) {
-                        render_elements.push(MaterialRenderElement::Shader(border));
-                    }
-
-                    if let Some(surface) = w.wl_surface() {
-                        let surf_elements = render_elements_from_surface_tree(
-                            renderer,
-                            &surface,
-                            (rect.loc.x, rect.loc.y),
-                            1.0,
-                            1.0,
-                            Kind::Unspecified,
-                        );
-                        for elem in surf_elements {
-                            render_elements.push(MaterialRenderElement::Surface(elem));
-                        }
-                    }
-
-                    if let Some(shadow) = state.ui.render_window_shadow(rect, 1.0) {
-                        render_elements.push(MaterialRenderElement::Shader(shadow));
-                    }
-                }
-
-                // 5. DESKTOP WALLPAPER (Bottom-most background element)
-                if let Some(wallpaper_elem) = state.ui.render_wallpaper(renderer, screen_size) {
-                    render_elements.push(MaterialRenderElement::Memory(wallpaper_elem));
-                }
-
-                let clear_color = state.ui.colors.surface_color();
-
-                // Strict damage tracking: only redraw damaged regions
-                let render_res = damage_tracker.render_output(
-                    renderer,
-                    &mut framebuffer,
-                    0,
-                    &render_elements,
-                    clear_color,
-                )?;
-
-                if auto_screenshot {
-                    let scratch_dir = "/home/wwmaxik/.gemini/antigravity-cli/brain/4058d2a8-2b7a-4ee4-b02f-1867e76dc498/scratch";
-                    match screenshot_step {
-                        0 => {
-                            let path = format!("{}/screenshot_desktop.png", scratch_dir);
-                            capture_screenshot(renderer, &mut framebuffer, screen_size, &path);
-                            state.ui.drawer.open(&state.ui.audio);
-                            state.ui.drawer.open_progress.set_immediate(1.0);
-                            state.ui.drawer.buffer_dirty = true;
-                            state.needs_redraw = true;
-                            screenshot_step = 1;
-                        }
-                        1 => {
-                            let path = format!("{}/screenshot_drawer.png", scratch_dir);
-                            capture_screenshot(renderer, &mut framebuffer, screen_size, &path);
-                            state.ui.drawer.close(&state.ui.audio);
-                            state.ui.drawer.open_progress.set_immediate(0.0);
-                            state.ui.launcher.open(&state.ui.audio);
-                            state.ui.launcher.open_progress.set_immediate(1.0);
-                            state.ui.launcher.buffer_dirty = true;
-                            state.needs_redraw = true;
-                            screenshot_step = 2;
-                        }
-                        2 => {
-                            let path = format!("{}/screenshot_launcher.png", scratch_dir);
-                            capture_screenshot(renderer, &mut framebuffer, screen_size, &path);
-                            state.running.store(false, Ordering::SeqCst);
-                            screenshot_step = 3;
-                        }
-                        _ => {}
-                    }
-                }
-
-                render_res.damage.cloned()
-            };
-
-            // Submit damaged buffer to GPU
-            if let Err(e) = backend.submit(damage_to_submit.as_deref()) {
-                tracing::warn!("backend.submit: {:?}", e);
-            }
-
-            // Send frame callbacks to clients
-            let elapsed_ms = state.start_time.elapsed().as_millis() as u32;
-            let windows = state.workspaces.active_workspace().windows.clone();
-            for w in &windows {
-                if let Some(surface) = w.wl_surface() {
-                    send_frames_surface_tree(&surface, elapsed_ms);
-                }
-            }
-        }
-
-        display.dispatch_clients(&mut state)?;
-        display.flush_clients()?;
-
-        // Calloop loop dispatch with minimal 2ms sleep to stay smooth and battery-friendly
-        let _ = event_loop.dispatch(Some(std::time::Duration::from_millis(2)), &mut state);
+        Ok(Self {
+            config,
+            output,
+            backend,
+            damage_tracker,
+            render_node: None,
+            dmabuf_global: None,
+            #[cfg(feature = "xdp-gnome-screencast")]
+            gbm_device: None,
+            ipc_outputs,
+        })
     }
 
-    Ok(())
-}
+    pub fn init(&mut self, niri: &mut Niri) {
+        let renderer = self.backend.renderer();
+        if let Err(err) = renderer.bind_wl_display(&niri.display_handle) {
+            // wl_drm is on its way out so this is expected on most modern distros.
+            trace!("error binding legacy EGL to wl_display: {err}");
+        } else {
+            debug!("bound legacy EGL to wl_display");
+        }
 
-fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
-    with_surface_tree_downward(
-        surface,
-        (),
-        |_, _, &()| TraversalAction::DoChildren(()),
-        |_surf, states, &()| {
-            for callback in states
-                .cached_state
-                .get::<SurfaceAttributes>()
-                .current()
-                .frame_callbacks
-                .drain(..)
+        resources::init(renderer);
+        shaders::init(renderer);
+
+        let config = self.config.borrow();
+        if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
+            shaders::set_custom_resize_program(renderer, Some(src));
+        }
+        if let Some(src) = config.animations.window_close.custom_shader.as_deref() {
+            shaders::set_custom_close_program(renderer, Some(src));
+        }
+        if let Some(src) = config.animations.window_open.custom_shader.as_deref() {
+            shaders::set_custom_open_program(renderer, Some(src));
+        }
+        drop(config);
+
+        niri.update_shaders();
+
+        // Winit creates a single EGL display, so its render node cannot change.
+        self.render_node = match self.fetch_render_node() {
+            Ok(node) => {
+                if let Some(path) = node.dev_path() {
+                    debug!("using as the render node: {path:?}");
+                } else {
+                    debug!("using as the render node: {node}");
+                }
+
+                Some(node)
+            }
+            Err(err) => {
+                debug!("failed querying render node: {err:?}");
+                None
+            }
+        };
+
+        self.create_dmabuf_global(niri);
+
+        #[cfg(feature = "xdp-gnome-screencast")]
+        if let Err(err) = self.create_gbm_device() {
+            debug!("couldn't create GBM device for screencasting: {err:?}");
+        };
+
+        niri.add_output(self.output.clone(), None, false);
+    }
+
+    fn fetch_render_node(&mut self) -> anyhow::Result<DrmNode> {
+        let display = self.backend.renderer().egl_context().display();
+        EGLDevice::device_for_display(display)
+            .context("error getting EGL device")?
+            .try_get_render_node()
+            .context("error getting EGL device render node")?
+            .context("failed to query EGL device render node")
+    }
+
+    pub fn create_dmabuf_global(&mut self, niri: &mut Niri) {
+        let renderer = self.backend.renderer();
+
+        let default_feedback = || {
+            let node = self
+                .render_node
+                .as_ref()
+                .context("no render node available")?;
+            let primary_formats = renderer.dmabuf_formats();
+            DmabufFeedbackBuilder::new(node.dev_id(), primary_formats)
+                .build()
+                .context("error building dmabuf feedback")
+        };
+
+        // Fallback to dmabuf v3 if we failed to build feedback.
+        let dmabuf_global = match default_feedback() {
+            Ok(feedback) => niri
+                .dmabuf_state
+                .create_global_with_default_feedback::<State>(&niri.display_handle, &feedback),
+            Err(err) => {
+                debug!("failed building default dmabuf feedback, falling back to v3: {err:?}");
+                let primary_formats = renderer.dmabuf_formats();
+                niri.dmabuf_state
+                    .create_global::<State>(&niri.display_handle, primary_formats)
+            }
+        };
+        assert!(self.dmabuf_global.replace(dmabuf_global).is_none());
+    }
+
+    #[cfg(feature = "xdp-gnome-screencast")]
+    fn create_gbm_device(&mut self) -> anyhow::Result<()> {
+        use std::os::fd::OwnedFd;
+
+        use smithay::backend::allocator::gbm::GbmDevice;
+        use smithay::utils::DeviceFd;
+
+        let node = self
+            .render_node
+            .as_ref()
+            .context("no render node available")?;
+        let path = node.dev_path().context("render node has no device path")?;
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .context("error opening render node")?;
+
+        let gbm_device = GbmDevice::new(DeviceFd::from(OwnedFd::from(file)))
+            .context("error creating GBM device")?;
+
+        self.gbm_device = Some(gbm_device);
+        Ok(())
+    }
+
+    #[cfg(feature = "xdp-gnome-screencast")]
+    pub fn gbm_device(
+        &self,
+    ) -> Option<smithay::backend::allocator::gbm::GbmDevice<smithay::utils::DeviceFd>> {
+        self.gbm_device.clone()
+    }
+
+    pub fn seat_name(&self) -> String {
+        "winit".to_owned()
+    }
+
+    pub fn with_primary_renderer<T>(
+        &mut self,
+        f: impl FnOnce(&mut GlesRenderer) -> T,
+    ) -> Option<T> {
+        Some(f(self.backend.renderer()))
+    }
+
+    pub fn primary_render_node(&mut self) -> Option<DrmNode> {
+        self.render_node
+    }
+
+    pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
+        let _span = tracy_client::span!("Winit::render");
+
+        // Render the elements.
+        let ctx = RenderCtx {
+            renderer: self.backend.renderer(),
+            target: RenderTarget::Output,
+            xray: None,
+        };
+        let mut elements = niri.render_to_vec(ctx, output, true);
+
+        // Visualize the damage, if enabled.
+        if niri.debug_draw_damage {
+            let output_state = niri.output_state.get_mut(output).unwrap();
+            draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
+        }
+
+        // Hand them over to winit.
+        let res = {
+            let (renderer, mut framebuffer) = self.backend.bind().unwrap();
+            // FIXME: currently impossible to call due to a mutable borrow.
+            //
+            // let age = self.backend.buffer_age().unwrap();
+            let age = 0;
+            self.damage_tracker
+                .render_output(renderer, &mut framebuffer, age, &elements, [0.; 4])
+                .unwrap()
+        };
+
+        niri.update_primary_scanout_output(output, &res.states);
+
+        let rv;
+        if let Some(damage) = res.damage {
+            if self
+                .config
+                .borrow()
+                .debug
+                .wait_for_frame_completion_before_queueing
             {
-                callback.done(time);
-            }
-        },
-        |_, _, &()| true,
-    );
-}
-
-fn capture_screenshot(
-    renderer: &mut GlesRenderer,
-    framebuffer: &mut GlesTarget<'_>,
-    size: Size<i32, Logical>,
-    path: &str,
-) {
-    use smithay::backend::allocator::Fourcc;
-    use smithay::backend::renderer::{ExportMem, Frame, Renderer};
-
-    let region = Rectangle::new((0, 0).into(), (size.w, size.h).into());
-    match renderer.copy_framebuffer(framebuffer, region, Fourcc::Abgr8888) {
-        Ok(mapping) => match renderer.map_texture(&mapping) {
-            Ok(slice) => {
-                let w = size.w as u32;
-                let h = size.h as u32;
-                match image::save_buffer(path, slice, w, h, image::ExtendedColorType::Rgba8) {
-                    Ok(_) => tracing::info!("Successfully captured screenshot to {}", path),
-                    Err(e) => tracing::warn!("Failed to save screenshot image: {:?}", e),
+                let _span = tracy_client::span!("wait for completion");
+                if let Err(err) = res.sync.wait() {
+                    warn!("error waiting for frame completion: {err:?}");
                 }
             }
-            Err(e) => tracing::warn!("Failed to map texture for screenshot: {:?}", e),
-        },
-        Err(e) => tracing::warn!("Failed to copy framebuffer for screenshot: {:?}", e),
+
+            self.backend.submit(Some(damage)).unwrap();
+
+            let mut presentation_feedbacks = niri.take_presentation_feedbacks(output, &res.states);
+            presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
+                get_monotonic_time(),
+                Refresh::Unknown,
+                0,
+                wp_presentation_feedback::Kind::empty(),
+            );
+
+            rv = RenderResult::Submitted;
+        } else {
+            rv = RenderResult::NoDamage;
+        }
+
+        let output_state = niri.output_state.get_mut(output).unwrap();
+        match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
+            RedrawState::Idle => unreachable!(),
+            RedrawState::Queued => (),
+            RedrawState::WaitingForVBlank { .. } => unreachable!(),
+            RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
+            RedrawState::WaitingForEstimatedVBlankAndQueued(_) => unreachable!(),
+        }
+
+        output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
+
+        // FIXME: this should wait until a frame callback from the host compositor, but it redraws
+        // right away instead.
+        if output_state.unfinished_animations_remain {
+            self.backend.window().request_redraw();
+        }
+
+        rv
     }
 
-    // Restore EGL surface binding after map_texture unbound it
-    let _ = renderer.render(framebuffer, (1, 1).into(), Transform::Normal).map(|f| f.finish());
+    pub fn toggle_debug_tint(&mut self) {
+        let renderer = self.backend.renderer();
+        renderer.set_debug_flags(renderer.debug_flags() ^ DebugFlags::TINT);
+    }
+
+    pub fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
+        match self.backend.renderer().import_dmabuf(dmabuf, None) {
+            Ok(_texture) => true,
+            Err(err) => {
+                debug!("error importing dmabuf: {err:?}");
+                false
+            }
+        }
+    }
+
+    pub fn ipc_outputs(&self) -> Arc<Mutex<IpcOutputMap>> {
+        self.ipc_outputs.clone()
+    }
 }

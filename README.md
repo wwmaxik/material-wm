@@ -1,94 +1,133 @@
 # material-wm
 
-<div align="center">
-  <h3>Monolithic Material You (crDroid-style) Wayland Desktop Environment</h3>
-  <p>Written entirely in Rust using the modern <a href="https://github.com/Smithay/smithay">Smithay</a> framework.</p>
-</div>
+**material-wm** is a monolithic, all-in-one Desktop Environment (DE) and Wayland compositor combining the **Material You (crDroid-style) visual design** with the production-tested **Niri** Smithay architecture.
 
----
+## Highlights
+- **Native Material Top Bar:** 38px height, launcher grid button, dynamic workspace pills, active window title, unified status chip with Wi-Fi, battery % and clock.
+- **crDroid-Style Quick Settings Drawer:** Fast drawer overlay featuring live clock/date, interactive capsule sliders for volume & brightness, 4 Material You quick tiles (Wi-Fi, Bluetooth, Night Light, Performance), and user footer card.
+- **Material App Launcher:** Centered modal card with elevation drop shadows, darkened backdrop scrim, real-time `.desktop` search, category badges, keyboard navigation and tactile feedback.
+- **Niri Foundation:** DRM/KMS, Udev, libinput handling, display hotplugging, XWayland clipboard sync, matrix-based damage-tracked rendering, 1:1 touchpad physics, and screencopy.
+- **Optimized for Low-Power Hardware:** Fully compatible with Intel Pentium N3700 (Silvermont/Airmont architecture) without requiring AVX/AVX2 instructions. Matrix animations and damage tracking keep CPU & GPU usage minimal.
 
-## 🌟 Highlights
+## About
 
-- **Aesthetic Fusion:** Material You (Android 13/14 crDroid ROM) visual language combined with Apple HIG human-centric interaction, fluid interruptible animations, and acoustic touch feedback.
-- **Self-Contained & Monolithic:** No external status bars (waybar), app launchers (rofi/fuzzel), or notification daemons needed. Everything is integrated into a single high-performance binary.
-- **Strict Damage Tracking:** Only redraws damaged rects via `smithay::backend::renderer::damage::OutputDamageTracker`. Zero wasted GPU cycles.
-- **Hardware Optimized:** Tailored for low-power Intel Braswell architecture (Pentium N3700, Intel HD Gen8 LP) with zero AVX requirements (`-C target-cpu=silvermont`).
-- **crDroid Quick Settings Drawer:** 2-column large pill cards, thick capsule sliders for Brightness & Volume with embedded icons, live date/time, battery status, and power actions.
-- **Native Top Bar:** Dynamic workspace capsules with expansion physics, active window title centering, and status quick chip.
-- **Built-in App Launcher:** Instant desktop entry indexing (`/usr/share/applications`, `~/.local/share/applications`), fuzzy search, harmonic M3 pastel avatar badges, and clean category mapping.
-- **Desktop Wallpaper:** Native high-quality background scaling with procedural Material You dark gradient fallback.
-- **Tiling & Floating:** Flexible Master-Stack layout with inner/outer gaps, dynamic ratio adjustment, floating window toggle, and interactive Super+drag / Super+resize.
-- **Multi-backend:** Seamless Winit backend for windowed testing inside existing sessions (KDE/GNOME/X11), and bare-metal KMS/DRM + Libinput backend for direct TTY execution.
+Windows are arranged in columns on an infinite strip going to the right.
+Opening a new window never causes existing windows to resize.
 
----
+Every monitor has its own separate window strip.
+Windows can never "overflow" onto an adjacent monitor.
 
-## ⌨️ Default Keybindings
+Workspaces are dynamic and arranged vertically.
+Every monitor has an independent set of workspaces, and there's always one empty workspace present all the way down.
 
-| Keybinding | Action |
-|---|---|
-| `Super + Return` | Launch Terminal (`kitty` / configured terminal) |
-| `Super + d` / `Super + Space` | Toggle Material You App Launcher |
-| `Super + s` | Toggle crDroid Quick Settings Drawer |
-| `Super + q` | Close Focused Window |
-| `Super + Shift + Space` | Toggle Window Floating / Tiling Mode |
-| `Super + 1..9` | Switch to Workspace 1–9 |
-| `Super + Shift + 1..9` | Move Focused Window to Workspace 1–9 |
-| `Super + j` / `Super + k` | Focus Next / Previous Window |
-| `Super + h` / `Super + l` | Adjust Master Split Ratio |
-| `Super + Left Click + Drag` | Move Floating Window |
-| `Super + Right Click + Drag`| Resize Floating Window |
-| `Super + Shift + q` | Quit `material-wm` |
+The workspace arrangement is preserved across disconnecting and connecting monitors where it makes sense.
+When a monitor disconnects, its workspaces will move to another monitor, but upon reconnection they will move back to the original monitor.
 
----
+## Features
 
-## 🚀 Building & Running
+- Built from the ground up for scrollable tiling
+- [Dynamic workspaces](https://niri-wm.github.io/niri/Workspaces.html) like in GNOME
+- An [Overview](https://github.com/user-attachments/assets/379a5d1f-acdb-4c11-b36c-e85fd91f0995) that zooms out workspaces and windows
+- Built-in screenshot UI
+- Monitor and window screencasting through xdg-desktop-portal-gnome
+    - You can [block out](https://niri-wm.github.io/niri/Configuration%3A-Window-Rules.html#block-out-from) sensitive windows from screencasts
+    - [Dynamic cast target](https://niri-wm.github.io/niri/Screencasting.html#dynamic-screencast-target) that can change what it shows on the go
+- [Touchpad](https://github.com/niri-wm/niri/assets/1794388/946a910e-9bec-4cd1-a923-4a9421707515) and [mouse](https://github.com/niri-wm/niri/assets/1794388/8464e65d-4bf2-44fa-8c8e-5883355bd000) gestures
+- Group windows into [tabs](https://niri-wm.github.io/niri/Tabs.html)
+- Configurable layout: gaps, borders, struts, window sizes
+- [Gradient borders](https://niri-wm.github.io/niri/Configuration%3A-Layout.html#gradients) with Oklab and Oklch support
+- [Background blur](https://niri-wm.github.io/niri/Window-Effects.html) for windows and layer-shell surfaces
+- [Animations](https://github.com/niri-wm/niri/assets/1794388/ce178da2-af9e-4c51-876f-8709c241d95e) with support for [custom shaders](https://github.com/niri-wm/niri/assets/1794388/27a238d6-0a22-4692-b794-30dc7a626fad)
+- Live-reloading config
+- Works with [screen readers](https://niri-wm.github.io/niri/Accessibility.html)
 
-### Requirements
-- Rust stable (edition 2021)
-- `libwayland-dev`, `libxkbcommon-dev`, `libgbm-dev`, `libinput-dev`, `libudev-dev`, `libasound2-dev`
+## Video Demo
 
-### Compilation
-```bash
-# Build release binary (uses -C target-cpu=silvermont)
-cargo build --release
-```
+https://github.com/niri-wm/niri/assets/1794388/bce834b0-f205-434e-a027-b373495f9729
 
-### Running inside existing desktop (Windowed / Testing)
-```bash
-cargo run --release
-```
+Also check out these videos that showcase a lot of the niri functionality:
 
-### Running on Bare Metal (DRM/KMS from TTY)
-```bash
-./target/release/material-wm --backend drm
-```
+- [Niri Is My New Favorite Wayland Compositor](https://www.youtube.com/watch?v=DeYx2exm04M) by Brodie Robertson
+- [How Is niri This Good? Live Demo + Config](https://www.youtube.com/watch?v=7XmD5UyyhZQ) by Nick Janetakis
 
----
+## Status
 
-## 🎨 Configuration
+Niri is stable for day-to-day use and does most things expected of a Wayland compositor.
+Many people are daily-driving niri, and are happy to help in our [Matrix channel].
 
-Configuration is loaded from `~/.config/material-wm/config.toml` (or fallback `./config.toml`).
+Give it a try!
+Follow the instructions on the [Getting Started](https://niri-wm.github.io/niri/Getting-Started.html) page.
+Grab a desktop shell like [DankMaterialShell] or [Noctalia] (or build a more traditional setup): niri by itself is not a complete desktop environment.
+Also check out [awesome-niri], a list of niri-related links and projects.
 
-```toml
-terminal = "kitty"
-bar_height = 32
-inner_gap = 8
-outer_gap = 12
-master_ratio = 0.55
-wallpaper_path = "~/Изображения/wallpapers/mashina4k.jpg"
+Here are some points you may have questions about:
 
-[theme]
-primary = "#D0BCFF"
-on_primary = "#381E72"
-surface = "#141218"
-surface_container = "#211F26"
-surface_container_high = "#2B2930"
-outline = "#938F99"
-outline_variant = "#49454F"
-error = "#F2B8B5"
-```
+- **Multi-monitor**: yes, a core part of the design from the very start. Mixed DPI works.
+- **Fractional scaling**: yes, plus all niri UI stays pixel-perfect.
+- **NVIDIA**: seems to work fine.
+- **Floating windows**: yes, starting from niri 25.01.
+- **Input devices**: niri supports tablets, touchpads, and touchscreens.
+You can map the tablet to a specific monitor, or use [OpenTabletDriver].
+We have touchpad gestures, but no touchscreen gestures yet.
+- **Wlr protocols**: yes, we have most of the important ones like layer-shell, gamma-control, screencopy.
+You can check on [wayland.app](https://wayland.app) at the bottom of each protocol's page.
+- **Performance**: while I run niri on beefy machines, I try to stay conscious of performance.
+I've seen someone use it fine on an Eee PC 900 from 2008, of all things.
+- **Xwayland**: [integrated](https://niri-wm.github.io/niri/Xwayland.html#using-xwayland-satellite) via xwayland-satellite starting from niri 25.08.
 
----
+## Media
 
-## 📜 License
-MIT License
+[niri: Making a Wayland compositor in Rust](https://youtu.be/Kmz8ODolnDg?list=PLRdS-n5seLRqrmWDQY4KDqtRMfIwU0U3T) · *December 2024*
+
+My talk from the 2024 Moscow RustCon about niri, and how I do randomized property testing and profiling, and measure input latency.
+The talk is in Russian, but I prepared full English subtitles that you can find in YouTube's subtitle language selector.
+
+[An interview with Ivan, the developer behind Niri](https://www.trommelspeicher.de/podcast/special_the_developer_behind_niri) · *June 2025*
+
+An interview by a German tech podcast Das Triumvirat (in English).
+We talk about niri development and history, and my experience building and maintaining niri.
+
+[A tour of the niri scrolling-tiling Wayland compositor](https://lwn.net/Articles/1025866/) · *July 2025*
+
+An LWN article with a nice overview and introduction to niri.
+
+## Contributing
+
+If you'd like to help with niri, there are plenty of both coding- and non-coding-related ways to do so.
+See [CONTRIBUTING.md](https://github.com/niri-wm/niri/blob/main/CONTRIBUTING.md) for an overview.
+
+## Inspiration
+
+Niri is heavily inspired by [PaperWM] which implements scrollable tiling on top of GNOME Shell.
+
+One of the reasons that prompted me to try writing my own compositor is being able to properly separate the monitors.
+Being a GNOME Shell extension, PaperWM has to work against Shell's global window coordinate space to prevent windows from overflowing.
+
+## Tile Scrollably Elsewhere
+
+Here are some other projects which implement a similar workflow:
+
+- [PaperWM]: scrollable tiling on top of GNOME Shell.
+- [karousel]: scrollable tiling on top of KDE.
+- [scroll](https://github.com/dawsers/scroll) and [papersway]: scrollable tiling on top of sway/i3.
+- Hyprland has a built-in [scrolling layout](https://wiki.hypr.land/Configuring/Layouts/Scrolling-Layout/).
+- [Paneru] and [PaperWM.spoon]: scrollable tiling on top of macOS.
+
+## Contact
+
+Our main communication channel is a Matrix chat, feel free to join and ask a question: https://matrix.to/#/#niri:matrix.org
+
+We also have a community Discord server: https://discord.gg/vT8Sfjy7sx
+
+[PaperWM]: https://github.com/paperwm/PaperWM
+[waybar]: https://github.com/Alexays/Waybar
+[fuzzel]: https://codeberg.org/dnkl/fuzzel
+[awesome-niri]: https://github.com/niri-wm/awesome-niri
+[karousel]: https://github.com/peterfajdiga/karousel
+[papersway]: https://spwhitton.name/tech/code/papersway/
+[Paneru]: https://github.com/karinushka/paneru
+[PaperWM.spoon]: https://github.com/mogenson/PaperWM.spoon
+[Matrix channel]: https://matrix.to/#/#niri:matrix.org
+[OpenTabletDriver]: https://opentabletdriver.net/
+[DankMaterialShell]: https://danklinux.com/
+[Noctalia]: https://noctalia.dev/
