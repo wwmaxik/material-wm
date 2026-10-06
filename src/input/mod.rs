@@ -535,6 +535,8 @@ impl State {
                                 Some(Keysym::KP_Enter) => "KP_Enter",
                                 Some(Keysym::Up) => "Up",
                                 Some(Keysym::Down) => "Down",
+                                Some(Keysym::Page_Up) => "Page_Up",
+                                Some(Keysym::Page_Down) => "Page_Down",
                                 Some(Keysym::BackSpace) => "BackSpace",
                                 _ => "",
                             };
@@ -3221,6 +3223,19 @@ impl State {
 
         let horizontal_amount_v120 = event.amount_v120(Axis::Horizontal);
         let vertical_amount_v120 = event.amount_v120(Axis::Vertical);
+
+        if self.niri.material_ui.launcher.borrow().is_open {
+            let delta = vertical_amount_v120
+                .map(|v| v / 120.0)
+                .or_else(|| event.amount(Axis::Vertical))
+                .unwrap_or(0.);
+            if delta.abs() > 0.01 {
+                if self.niri.material_ui.on_pointer_scroll(delta) {
+                    self.niri.queue_redraw_all();
+                    return;
+                }
+            }
+        }
 
         let is_overview_open = self.niri.layout.is_overview_open();
 

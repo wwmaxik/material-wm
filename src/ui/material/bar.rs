@@ -176,7 +176,8 @@ impl MaterialTopBar {
                     }
 
                     // 5. Unified Status Chip (top-right)
-                    let chip_w = 170.0;
+                    let sys_info = super::system::SystemInfo::probe();
+                    let chip_w = if sys_info.battery.is_some() { 170.0 } else { 96.0 };
                     let chip_h = 24.0;
                     let chip_x = screen_w - chip_w - 12.0;
                     let chip_y = (Self::HEIGHT as f64 - chip_h) / 2.0;
@@ -185,48 +186,77 @@ impl MaterialTopBar {
                     Self::draw_rounded_rect(&cr, chip_x, chip_y, chip_w, chip_h, 12.0);
                     let _ = cr.fill();
 
-                    // Wi-Fi icon (arc waves)
-                    Self::set_source_color(&cr, colors.primary);
-                    let wx = chip_x + 16.0;
-                    let wy = chip_y + 16.0;
-                    cr.arc(wx, wy, 2.0, 0.0, 2.0 * std::f64::consts::PI);
-                    let _ = cr.fill();
-                    cr.set_line_width(1.5);
-                    cr.arc(wx, wy, 5.0, -std::f64::consts::PI * 0.75, -std::f64::consts::PI * 0.25);
-                    let _ = cr.stroke();
-                    cr.arc(wx, wy, 8.5, -std::f64::consts::PI * 0.75, -std::f64::consts::PI * 0.25);
-                    let _ = cr.stroke();
+                    // Network icon (Ethernet vs Wi-Fi)
+                    match &sys_info.network {
+                        super::system::NetworkKind::Ethernet(_) => {
+                            let ex = chip_x + 10.0;
+                            let ey = chip_y + 6.0;
+                            Self::set_source_color(&cr, colors.primary);
+                            Self::draw_rounded_rect(&cr, ex, ey, 14.0, 12.0, 2.5);
+                            cr.set_line_width(1.3);
+                            let _ = cr.stroke();
+                            cr.rectangle(ex + 4.0, ey + 8.5, 6.0, 3.5);
+                            let _ = cr.fill();
+                        }
+                        super::system::NetworkKind::Wifi(_) => {
+                            Self::set_source_color(&cr, colors.primary);
+                            let wx = chip_x + 16.0;
+                            let wy = chip_y + 16.0;
+                            cr.arc(wx, wy, 2.0, 0.0, 2.0 * std::f64::consts::PI);
+                            let _ = cr.fill();
+                            cr.set_line_width(1.5);
+                            cr.arc(wx, wy, 5.0, -std::f64::consts::PI * 0.75, -std::f64::consts::PI * 0.25);
+                            let _ = cr.stroke();
+                            cr.arc(wx, wy, 8.5, -std::f64::consts::PI * 0.75, -std::f64::consts::PI * 0.25);
+                            let _ = cr.stroke();
+                        }
+                        super::system::NetworkKind::Disconnected => {
+                            Self::set_source_color(&cr, colors.outline);
+                            let wx = chip_x + 16.0;
+                            let wy = chip_y + 12.0;
+                            cr.arc(wx, wy, 3.0, 0.0, 2.0 * std::f64::consts::PI);
+                            let _ = cr.fill();
+                        }
+                    }
 
-                    // Battery icon + 85% text
-                    let bx = chip_x + 36.0;
-                    let by = chip_y + 7.0;
-                    Self::set_source_color(&cr, colors.outline);
-                    Self::draw_rounded_rect(&cr, bx, by, 18.0, 10.0, 2.0);
-                    let _ = cr.stroke();
-                    // Battery terminal tip
-                    cr.rectangle(bx + 18.0, by + 3.0, 2.0, 4.0);
-                    let _ = cr.fill();
-                    // Battery fill 85%
-                    Self::set_source_color(&cr, colors.primary);
-                    cr.rectangle(bx + 2.0, by + 2.0, 12.0, 6.0);
-                    let _ = cr.fill();
+                    // Battery icon (only if battery actually exists on system)
+                    if let Some(bat) = sys_info.battery {
+                        let bx = chip_x + 34.0;
+                        let by = chip_y + 7.0;
+                        Self::set_source_color(&cr, colors.outline);
+                        Self::draw_rounded_rect(&cr, bx, by, 18.0, 10.0, 2.0);
+                        cr.set_line_width(1.2);
+                        let _ = cr.stroke();
+                        cr.rectangle(bx + 18.0, by + 3.0, 2.0, 4.0);
+                        let _ = cr.fill();
+                        let fill_w = (14.0 * (bat.capacity as f64 / 100.0)).clamp(2.0, 14.0);
+                        Self::set_source_color(&cr, colors.primary);
+                        cr.rectangle(bx + 2.0, by + 2.0, fill_w, 6.0);
+                        let _ = cr.fill();
 
-                    Self::draw_text(
-                        &cr,
-                        "85%",
-                        "sans 10px",
-                        colors.on_surface_variant,
-                        bx + 26.0,
-                        chip_y + 5.0,
-                    );
+                        let cap_text = format!("{}%", bat.capacity);
+                        Self::draw_text(
+                            &cr,
+                            &cap_text,
+                            "sans 10px",
+                            colors.on_surface_variant,
+                            bx + 26.0,
+                            chip_y + 5.0,
+                        );
+                    }
 
                     // Clock HH:MM
+                    let clock_x = if sys_info.battery.is_some() {
+                        chip_x + 115.0
+                    } else {
+                        chip_x + 36.0
+                    };
                     Self::draw_text(
                         &cr,
                         &time_str,
                         "sans bold 12px",
                         colors.on_surface,
-                        chip_x + 115.0,
+                        clock_x,
                         chip_y + 3.5,
                     );
 

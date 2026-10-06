@@ -2,6 +2,7 @@ pub mod audio;
 pub mod bar;
 pub mod drawer;
 pub mod launcher;
+pub mod system;
 pub mod theme;
 pub mod wallpaper;
 
@@ -154,6 +155,17 @@ impl MaterialUiState {
                 self.drawer.borrow_mut().on_pointer_motion(x, screen_w, &self.audio);
                 return true;
             }
+        }
+        false
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.drawer.borrow().is_animating() || self.launcher.borrow().is_animating()
+    }
+
+    pub fn on_pointer_scroll(&self, delta_y: f64) -> bool {
+        if self.launcher.borrow().is_open {
+            return self.launcher.borrow_mut().on_scroll(delta_y, &self.audio);
         }
         false
     }

@@ -31,8 +31,10 @@ pub struct AppEntry {
 pub struct MaterialAppLauncher {
     pub is_open: bool,
     pub progress: f64,
+    pub target_progress: f64,
     pub search_query: String,
     pub selected_idx: usize,
+    pub scroll_idx: usize,
     pub apps: Vec<AppEntry>,
     dirty: bool,
     cached_buffer: Option<TextureBuffer<GlesTexture>>,
@@ -49,8 +51,10 @@ impl MaterialAppLauncher {
         Self {
             is_open: false,
             progress: 0.0,
+            target_progress: 0.0,
             search_query: String::new(),
             selected_idx: 0,
+            scroll_idx: 0,
             apps,
             dirty: true,
             cached_buffer: None,
@@ -69,9 +73,10 @@ impl MaterialAppLauncher {
     pub fn open(&mut self, audio: &AudioManager) {
         if !self.is_open {
             self.is_open = true;
-            self.progress = 1.0;
+            self.target_progress = 1.0;
             self.search_query.clear();
             self.selected_idx = 0;
+            self.scroll_idx = 0;
             self.dirty = true;
             audio.play_click();
         }
@@ -80,10 +85,53 @@ impl MaterialAppLauncher {
     pub fn close(&mut self, audio: &AudioManager) {
         if self.is_open {
             self.is_open = false;
-            self.progress = 0.0;
+            self.target_progress = 0.0;
             self.dirty = true;
             audio.play_click();
         }
+    }
+
+    pub fn is_animating(&self) -> bool {
+        (self.target_progress - self.progress).abs() > 0.005
+    }
+
+    pub fn on_scroll(&mut self, delta_y: f64, audio: &AudioManager) -> bool {
+        if !self.is_open {
+            return false;
+        }
+
+        let filtered_count = self.filtered_apps().len();
+        let max_visible = 6;
+        if filtered_count <= max_visible {
+            return false;
+        }
+
+        let max_scroll = filtered_count - max_visible;
+        if delta_y > 0.0 {
+            // Scroll down
+            if self.scroll_idx < max_scroll {
+                self.scroll_idx += 1;
+                if self.selected_idx < self.scroll_idx {
+                    self.selected_idx = self.scroll_idx;
+                }
+                self.dirty = true;
+                audio.play_tick();
+                return true;
+            }
+        } else if delta_y < 0.0 {
+            // Scroll up
+            if self.scroll_idx > 0 {
+                self.scroll_idx -= 1;
+                if self.selected_idx >= self.scroll_idx + max_visible {
+                    self.selected_idx = self.scroll_idx + max_visible - 1;
+                }
+                self.dirty = true;
+                audio.play_tick();
+                return true;
+            }
+        }
+
+        false
     }
 
     pub fn filtered_apps(&self) -> Vec<&AppEntry> {
@@ -125,6 +173,9 @@ impl MaterialAppLauncher {
             "Up" => {
                 if self.selected_idx > 0 {
                     self.selected_idx -= 1;
+                    if self.selected_idx < self.scroll_idx {
+                        self.scroll_idx = self.selected_idx;
+                    }
                     self.dirty = true;
                     audio.play_tick();
                 }
@@ -133,14 +184,41 @@ impl MaterialAppLauncher {
             "Down" => {
                 if filtered_count > 0 && self.selected_idx + 1 < filtered_count {
                     self.selected_idx += 1;
+                    let max_visible = 6;
+                    if self.selected_idx >= self.scroll_idx + max_visible {
+                        self.scroll_idx = self.selected_idx - max_visible + 1;
+                    }
                     self.dirty = true;
                     audio.play_tick();
                 }
                 true
             }
+            "Page_Up" => {
+                let step = 5;
+                self.selected_idx = self.selected_idx.saturating_sub(step);
+                self.scroll_idx = self.scroll_idx.saturating_sub(step);
+                self.dirty = true;
+                audio.play_tick();
+                true
+            }
+            "Page_Down" => {
+                let step = 5;
+                if filtered_count > 0 {
+                    self.selected_idx = (self.selected_idx + step).min(filtered_count - 1);
+                    let max_visible = 6;
+                    if filtered_count > max_visible {
+                        let max_scroll = filtered_count - max_visible;
+                        self.scroll_idx = (self.scroll_idx + step).min(max_scroll);
+                    }
+                }
+                self.dirty = true;
+                audio.play_tick();
+                true
+            }
             "BackSpace" => {
                 if self.search_query.pop().is_some() {
                     self.selected_idx = 0;
+                    self.scroll_idx = 0;
                     self.dirty = true;
                     audio.play_tick();
                 }
@@ -183,16 +261,19 @@ impl MaterialAppLauncher {
             return true;
         }
 
-        // List starts after search pill
-        let list_y = card_y + 78.0;
-        let item_h = 52.0;
+        // List starts after search pill (search_y: 20, search_h: 44, gap: 16 -> 80)
+        let list_y = card_y + 80.0;
+        let item_h = 54.0;
         if y >= list_y {
-            let idx = ((y - list_y) / item_h) as usize;
-            let filtered = self.filtered_apps();
-            if let Some(app) = filtered.get(idx) {
-                Self::launch_app(app);
-                self.close(audio);
-                return true;
+            let row = ((y - list_y) / item_h) as usize;
+            if row < 6 {
+                let app_idx = self.scroll_idx + row;
+                let filtered = self.filtered_apps();
+                if let Some(app) = filtered.get(app_idx) {
+                    Self::launch_app(app);
+                    self.close(audio);
+                    return true;
+                }
             }
         }
 
@@ -206,6 +287,13 @@ impl MaterialAppLauncher {
         colors: &M3Colors,
         push: &mut dyn FnMut(crate::niri::OutputRenderElements<R>),
     ) {
+        let diff = self.target_progress - self.progress;
+        if diff.abs() > 0.005 {
+            self.progress += diff * 0.28;
+        } else {
+            self.progress = self.target_progress;
+        }
+
         if !self.is_open && self.progress < 0.01 {
             return;
         }
@@ -215,8 +303,9 @@ impl MaterialAppLauncher {
         let screen_w = size.w;
         let screen_h = size.h;
 
+        let slide_y = (1.0 - self.progress) * -30.0;
         let card_x = (screen_w - Self::CARD_W) / 2.0;
-        let card_y = (screen_h - Self::CARD_H) / 2.0;
+        let card_y = (screen_h - Self::CARD_H) / 2.0 + slide_y;
 
         // 1. Darkened backdrop scrim over entire screen
         let backdrop = self.backdrop_buffer.get_or_insert_with(|| {
@@ -226,7 +315,7 @@ impl MaterialAppLauncher {
         let scrim_elem = SolidColorRenderElement::from_buffer(
             backdrop,
             (0., 0.),
-            self.progress as f32,
+            (self.progress * 0.55) as f32,
             Kind::Unspecified,
         );
         push(scrim_elem.into());
@@ -326,14 +415,11 @@ impl MaterialAppLauncher {
                     let item_h = 50.0;
                     let filtered = self.filtered_apps();
                     let max_visible = 6;
-                    let start_idx = if self.selected_idx >= max_visible {
-                        self.selected_idx - max_visible + 1
-                    } else {
-                        0
-                    };
+                    let has_scroll = filtered.len() > max_visible;
+                    let list_w = if has_scroll { search_w - 14.0 } else { search_w };
 
                     for i in 0..max_visible {
-                        let app_idx = start_idx + i;
+                        let app_idx = self.scroll_idx + i;
                         if app_idx >= filtered.len() {
                             break;
                         }
@@ -345,11 +431,11 @@ impl MaterialAppLauncher {
                         // Selection pill background
                         if is_selected {
                             Self::set_source_color(&cr, colors.primary_container);
-                            Self::draw_rounded_rect(&cr, search_x, item_y, search_w, item_h, 18.0);
+                            Self::draw_rounded_rect(&cr, search_x, item_y, list_w, item_h, 18.0);
                             let _ = cr.fill();
                         } else {
                             Self::set_source_color(&cr, colors.surface_container_high);
-                            Self::draw_rounded_rect(&cr, search_x, item_y, search_w, item_h, 18.0);
+                            Self::draw_rounded_rect(&cr, search_x, item_y, list_w, item_h, 18.0);
                             let _ = cr.fill();
                         }
 
@@ -411,6 +497,31 @@ impl MaterialAppLauncher {
                             search_x + 52.0,
                             item_y + 27.5,
                         );
+                    }
+
+                    // Vertical scrollbar pill
+                    if has_scroll {
+                        let scrollbar_x = search_x + search_w - 6.0;
+                        let track_y = list_y;
+                        let track_h = max_visible as f64 * (item_h + 4.0) - 4.0;
+                        let thumb_h = (track_h * (max_visible as f64 / filtered.len() as f64)).max(22.0);
+                        let max_scroll = (filtered.len() - max_visible) as f64;
+                        let scroll_ratio = if max_scroll > 0.0 {
+                            self.scroll_idx as f64 / max_scroll
+                        } else {
+                            0.0
+                        };
+                        let thumb_y = track_y + scroll_ratio * (track_h - thumb_h);
+
+                        // Track
+                        Self::set_source_color(&cr, [1.0, 1.0, 1.0, 0.06]);
+                        Self::draw_rounded_rect(&cr, scrollbar_x, track_y, 4.0, track_h, 2.0);
+                        let _ = cr.fill();
+
+                        // Thumb pill
+                        Self::set_source_color(&cr, colors.primary);
+                        Self::draw_rounded_rect(&cr, scrollbar_x, thumb_y, 4.0, thumb_h, 2.0);
+                        let _ = cr.fill();
                     }
 
                     drop(cr);

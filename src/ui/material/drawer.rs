@@ -38,6 +38,7 @@ pub struct CapsuleSlider {
 pub struct MaterialQuickSettingsDrawer {
     pub is_open: bool,
     pub progress: f64, // 0.0 to 1.0
+    pub target_progress: f64,
     pub tiles: [QuickTile; 4],
     pub brightness: CapsuleSlider,
     pub volume: CapsuleSlider,
@@ -51,12 +52,19 @@ impl MaterialQuickSettingsDrawer {
     pub const CARD_H: f64 = 380.0;
 
     pub fn new() -> Self {
+        let sys_info = super::system::SystemInfo::probe();
+        let (net_title, net_sub, net_active) = match &sys_info.network {
+            super::system::NetworkKind::Ethernet(iface) => ("Ethernet", format!("Подключено ({})", iface), true),
+            super::system::NetworkKind::Wifi(iface) => ("Wi-Fi", format!("Подключено ({})", iface), true),
+            super::system::NetworkKind::Disconnected => ("Сеть", "Отключено".into(), false),
+        };
+
         let tiles = [
             QuickTile {
                 id: QuickTileId::Wifi,
-                active: true,
-                title: "Интернет",
-                subtitle: "Wi-Fi (Подключено)".into(),
+                active: net_active,
+                title: net_title,
+                subtitle: net_sub,
             },
             QuickTile {
                 id: QuickTileId::Bluetooth,
@@ -81,6 +89,7 @@ impl MaterialQuickSettingsDrawer {
         Self {
             is_open: false,
             progress: 0.0,
+            target_progress: 0.0,
             tiles,
             brightness: CapsuleSlider {
                 value: 0.75,
@@ -109,7 +118,25 @@ impl MaterialQuickSettingsDrawer {
     pub fn open(&mut self, audio: &AudioManager) {
         if !self.is_open {
             self.is_open = true;
-            self.progress = 1.0;
+            self.target_progress = 1.0;
+            let sys_info = super::system::SystemInfo::probe();
+            match &sys_info.network {
+                super::system::NetworkKind::Ethernet(iface) => {
+                    self.tiles[0].title = "Ethernet";
+                    self.tiles[0].subtitle = format!("Подключено ({})", iface);
+                    self.tiles[0].active = true;
+                }
+                super::system::NetworkKind::Wifi(iface) => {
+                    self.tiles[0].title = "Wi-Fi";
+                    self.tiles[0].subtitle = format!("Подключено ({})", iface);
+                    self.tiles[0].active = true;
+                }
+                super::system::NetworkKind::Disconnected => {
+                    self.tiles[0].title = "Сеть";
+                    self.tiles[0].subtitle = "Отключено".into();
+                    self.tiles[0].active = false;
+                }
+            }
             self.dirty = true;
             audio.play_click();
         }
@@ -118,11 +145,16 @@ impl MaterialQuickSettingsDrawer {
     pub fn close(&mut self, audio: &AudioManager) {
         if self.is_open {
             self.is_open = false;
-            self.progress = 0.0;
+            self.target_progress = 0.0;
             self.brightness.is_dragging = false;
             self.volume.is_dragging = false;
+            self.dirty = true;
             audio.play_click();
         }
+    }
+
+    pub fn is_animating(&self) -> bool {
+        (self.target_progress - self.progress).abs() > 0.005
     }
 
     pub fn on_pointer_down(&mut self, x: f64, y: f64, screen_w: f64, audio: &AudioManager) -> bool {
@@ -170,11 +202,29 @@ impl MaterialQuickSettingsDrawer {
                     self.tiles[idx].active = !self.tiles[idx].active;
                     match self.tiles[idx].id {
                         QuickTileId::Wifi => {
-                            self.tiles[idx].subtitle = if self.tiles[idx].active {
-                                "Wi-Fi (Подключено)".into()
-                            } else {
-                                "Отключено".into()
-                            };
+                            let sys_info = super::system::SystemInfo::probe();
+                            match &sys_info.network {
+                                super::system::NetworkKind::Ethernet(iface) => {
+                                    self.tiles[idx].title = "Ethernet";
+                                    self.tiles[idx].subtitle = if self.tiles[idx].active {
+                                        format!("Подключено ({})", iface)
+                                    } else {
+                                        "Отключено".into()
+                                    };
+                                }
+                                super::system::NetworkKind::Wifi(iface) => {
+                                    self.tiles[idx].title = "Wi-Fi";
+                                    self.tiles[idx].subtitle = if self.tiles[idx].active {
+                                        format!("Подключено ({})", iface)
+                                    } else {
+                                        "Отключено".into()
+                                    };
+                                }
+                                super::system::NetworkKind::Disconnected => {
+                                    self.tiles[idx].title = "Сеть";
+                                    self.tiles[idx].subtitle = "Отключено".into();
+                                }
+                            }
                         }
                         QuickTileId::Bluetooth => {
                             self.tiles[idx].subtitle = if self.tiles[idx].active {
@@ -257,6 +307,17 @@ impl MaterialQuickSettingsDrawer {
         output: &Output,
         colors: &M3Colors,
     ) -> Option<PrimaryGpuTextureRenderElement> {
+        if !self.is_open && self.progress < 0.01 {
+            return None;
+        }
+
+        let diff = self.target_progress - self.progress;
+        if diff.abs() > 0.005 {
+            self.progress += diff * 0.28;
+        } else {
+            self.progress = self.target_progress;
+        }
+
         if !self.is_open && self.progress < 0.01 {
             return None;
         }
@@ -480,17 +541,31 @@ impl MaterialQuickSettingsDrawer {
                             Self::set_source_color(&cr, fg_title);
                             match tile.id {
                                 QuickTileId::Wifi => {
-                                    cr.arc(tx + 22.0, ty + 36.0, 2.0, 0.0, 2.0 * std::f64::consts::PI);
-                                    let _ = cr.fill();
-                                    cr.set_line_width(1.6);
-                                    cr.arc(
-                                        tx + 22.0,
-                                        ty + 36.0,
-                                        6.0,
-                                        -std::f64::consts::PI * 0.75,
-                                        -std::f64::consts::PI * 0.25,
-                                    );
-                                    let _ = cr.stroke();
+                                    let sys_info = super::system::SystemInfo::probe();
+                                    match &sys_info.network {
+                                        super::system::NetworkKind::Ethernet(_) => {
+                                            let ex = tx + 14.0;
+                                            let ey = ty + 28.0;
+                                            Self::draw_rounded_rect(&cr, ex, ey, 16.0, 14.0, 2.5);
+                                            cr.set_line_width(1.6);
+                                            let _ = cr.stroke();
+                                            cr.rectangle(ex + 4.5, ey + 10.0, 7.0, 4.0);
+                                            let _ = cr.fill();
+                                        }
+                                        _ => {
+                                            cr.arc(tx + 22.0, ty + 36.0, 2.0, 0.0, 2.0 * std::f64::consts::PI);
+                                            let _ = cr.fill();
+                                            cr.set_line_width(1.6);
+                                            cr.arc(
+                                                tx + 22.0,
+                                                ty + 36.0,
+                                                6.0,
+                                                -std::f64::consts::PI * 0.75,
+                                                -std::f64::consts::PI * 0.25,
+                                            );
+                                            let _ = cr.stroke();
+                                        }
+                                    }
                                 }
                                 QuickTileId::Bluetooth => {
                                     cr.set_line_width(1.8);
@@ -562,12 +637,23 @@ impl MaterialQuickSettingsDrawer {
                         footer_y + 11.0,
                     );
 
+                    let sys_info = super::system::SystemInfo::probe();
+                    let footer_text = if let Some(bat) = sys_info.battery {
+                        format!("material-wm • {}%", bat.capacity)
+                    } else {
+                        match &sys_info.network {
+                            super::system::NetworkKind::Ethernet(iface) => format!("material-wm • {}", iface),
+                            super::system::NetworkKind::Wifi(iface) => format!("material-wm • {}", iface),
+                            super::system::NetworkKind::Disconnected => "material-wm • Офлайн".into(),
+                        }
+                    };
+
                     Self::draw_text(
                         &cr,
-                        "material-wm • 85%",
+                        &footer_text,
                         "sans 11px",
                         colors.on_surface_variant,
-                        slider_x + slider_w - 110.0,
+                        slider_x + slider_w - 120.0,
                         footer_y + 11.0,
                     );
 
@@ -593,7 +679,8 @@ impl MaterialQuickSettingsDrawer {
 
         let buffer = self.cached_buffer.clone()?;
         let card_x = screen_w - Self::CARD_W - 16.0 - 24.0;
-        let card_y = 46.0 - 24.0;
+        let slide_y = (1.0 - self.progress) * -40.0;
+        let card_y = 46.0 - 24.0 + slide_y;
         let elem = TextureRenderElement::from_texture_buffer(
             buffer,
             Point::new(card_x, card_y),
