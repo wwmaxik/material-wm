@@ -8,12 +8,12 @@ use smithay::backend::input::{
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget};
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::{Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 use smithay::wayland::compositor::{with_surface_tree_downward, SurfaceAttributes, TraversalAction};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::reexports::winit::platform::pump_events::PumpStatus;
@@ -37,7 +37,10 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     state.screen_size = logical_size;
     state.gesture_tracker.screen_width = logical_size.w;
 
-    let mut damage_tracker = OutputDamageTracker::new(win_size, 1.0, Transform::Flipped180);
+    let mut damage_tracker = OutputDamageTracker::new(win_size, 1.0, Transform::Normal);
+
+    let auto_screenshot = std::env::var("MATERIAL_WM_AUTOSCREENSHOT").is_ok();
+    let mut screenshot_step: u32 = 0;
 
     // Initialize Material You GLES SDF shaders on the backend renderer
     {
@@ -62,7 +65,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let logical = Size::from((size.w as i32, size.h as i32));
                 state.screen_size = logical;
                 state.gesture_tracker.screen_width = logical.w;
-                damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Flipped180);
+                damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
                 state.needs_redraw = true;
             }
             WinitEvent::Input(input_event) => match input_event {
@@ -126,17 +129,27 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
                 let mut render_elements: Vec<MaterialRenderElement> = Vec::new();
 
-                // 1. Application Launcher text overlay (front-most element)
-                if let Some(text_elem) = state.ui.render_launcher_text(renderer, screen_size) {
-                    render_elements.push(MaterialRenderElement::Memory(text_elem));
+                // 1. APPLICATION LAUNCHER (Topmost modal layer when open)
+                if state.ui.launcher.is_open || state.ui.launcher.open_progress.value() > 0.01 {
+                    if let Some(text_elem) = state.ui.render_launcher_text(renderer, screen_size) {
+                        render_elements.push(MaterialRenderElement::Memory(text_elem));
+                    }
+                    for elem in state.ui.render_launcher_shaders(screen_size) {
+                        render_elements.push(MaterialRenderElement::Shader(elem));
+                    }
                 }
 
-                // 2. crDroid Quick Settings Drawer text overlay
-                if let Some(drawer_text) = state.ui.render_drawer_text(renderer, screen_size) {
-                    render_elements.push(MaterialRenderElement::Memory(drawer_text));
+                // 2. QUICK SETTINGS DRAWER (Drawer overlay layer when open)
+                if state.ui.drawer.is_open || state.ui.drawer.open_progress.value() > 0.01 {
+                    if let Some(drawer_text) = state.ui.render_drawer_text(renderer, screen_size) {
+                        render_elements.push(MaterialRenderElement::Memory(drawer_text));
+                    }
+                    for elem in state.ui.render_drawer_shaders(screen_size) {
+                        render_elements.push(MaterialRenderElement::Shader(elem));
+                    }
                 }
 
-                // 3. Client windows and top bar context
+                // 3. TOP STATUS BAR (Bar text on top of bar shaders)
                 let active_ws = state.workspaces.active_workspace();
                 let focused = active_ws.focused_window.clone();
                 let active_title = focused.as_ref().and_then(|w| {
@@ -149,18 +162,14 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     })
                 });
 
-                // Top bar text overlay (workspaces, active title, battery/clock)
                 if let Some(bar_text) = state.ui.render_bar_text(renderer, screen_size, active_ws.id, active_title.as_deref()) {
                     render_elements.push(MaterialRenderElement::Memory(bar_text));
                 }
-
-                // 4. UI Overlay Shaders: Launcher, Drawer, and Top Bar
-                let ui_elements = state.ui.render_ui(renderer, screen_size);
-                for elem in ui_elements {
+                for elem in state.ui.render_bar_shaders(screen_size) {
                     render_elements.push(MaterialRenderElement::Shader(elem));
                 }
 
-                // 5. Client windows in front-to-back order (space.elements().rev())
+                // 4. CLIENT WINDOWS (Front-to-back: focused window first)
                 for w in state.space.elements().rev() {
                     if !active_ws.windows.contains(w) {
                         continue;
@@ -170,7 +179,6 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     });
                     let is_focused = focused.as_ref() == Some(w);
 
-                    // Front-to-back for each window: border -> surfaces -> drop shadow
                     if let Some(border) = state.ui.render_window_border(rect, is_focused, 1.0) {
                         render_elements.push(MaterialRenderElement::Shader(border));
                     }
@@ -194,7 +202,7 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // 6. Desktop Wallpaper (bottom-most background element)
+                // 5. DESKTOP WALLPAPER (Bottom-most background element)
                 if let Some(wallpaper_elem) = state.ui.render_wallpaper(renderer, screen_size) {
                     render_elements.push(MaterialRenderElement::Memory(wallpaper_elem));
                 }
@@ -210,11 +218,46 @@ pub fn run_winit(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     clear_color,
                 )?;
 
+                if auto_screenshot {
+                    let scratch_dir = "/home/wwmaxik/.gemini/antigravity-cli/brain/4058d2a8-2b7a-4ee4-b02f-1867e76dc498/scratch";
+                    match screenshot_step {
+                        0 => {
+                            let path = format!("{}/screenshot_desktop.png", scratch_dir);
+                            capture_screenshot(renderer, &mut framebuffer, screen_size, &path);
+                            state.ui.drawer.open(&state.ui.audio);
+                            state.ui.drawer.open_progress.set_immediate(1.0);
+                            state.ui.drawer.buffer_dirty = true;
+                            state.needs_redraw = true;
+                            screenshot_step = 1;
+                        }
+                        1 => {
+                            let path = format!("{}/screenshot_drawer.png", scratch_dir);
+                            capture_screenshot(renderer, &mut framebuffer, screen_size, &path);
+                            state.ui.drawer.close(&state.ui.audio);
+                            state.ui.drawer.open_progress.set_immediate(0.0);
+                            state.ui.launcher.open(&state.ui.audio);
+                            state.ui.launcher.open_progress.set_immediate(1.0);
+                            state.ui.launcher.buffer_dirty = true;
+                            state.needs_redraw = true;
+                            screenshot_step = 2;
+                        }
+                        2 => {
+                            let path = format!("{}/screenshot_launcher.png", scratch_dir);
+                            capture_screenshot(renderer, &mut framebuffer, screen_size, &path);
+                            state.running.store(false, Ordering::SeqCst);
+                            screenshot_step = 3;
+                        }
+                        _ => {}
+                    }
+                }
+
                 render_res.damage.cloned()
             };
 
             // Submit damaged buffer to GPU
-            backend.submit(damage_to_submit.as_deref())?;
+            if let Err(e) = backend.submit(damage_to_submit.as_deref()) {
+                tracing::warn!("backend.submit: {:?}", e);
+            }
 
             // Send frame callbacks to clients
             let elapsed_ms = state.start_time.elapsed().as_millis() as u32;
@@ -254,4 +297,33 @@ fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
         },
         |_, _, &()| true,
     );
+}
+
+fn capture_screenshot(
+    renderer: &mut GlesRenderer,
+    framebuffer: &mut GlesTarget<'_>,
+    size: Size<i32, Logical>,
+    path: &str,
+) {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::{ExportMem, Frame, Renderer};
+
+    let region = Rectangle::new((0, 0).into(), (size.w, size.h).into());
+    match renderer.copy_framebuffer(framebuffer, region, Fourcc::Abgr8888) {
+        Ok(mapping) => match renderer.map_texture(&mapping) {
+            Ok(slice) => {
+                let w = size.w as u32;
+                let h = size.h as u32;
+                match image::save_buffer(path, slice, w, h, image::ExtendedColorType::Rgba8) {
+                    Ok(_) => tracing::info!("Successfully captured screenshot to {}", path),
+                    Err(e) => tracing::warn!("Failed to save screenshot image: {:?}", e),
+                }
+            }
+            Err(e) => tracing::warn!("Failed to map texture for screenshot: {:?}", e),
+        },
+        Err(e) => tracing::warn!("Failed to copy framebuffer for screenshot: {:?}", e),
+    }
+
+    // Restore EGL surface binding after map_texture unbound it
+    let _ = renderer.render(framebuffer, (1, 1).into(), Transform::Normal).map(|f| f.finish());
 }

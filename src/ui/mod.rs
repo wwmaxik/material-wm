@@ -114,9 +114,39 @@ impl UiManager {
     }
 
     /// Render UI overlay (Top Bar + Quick Settings Drawer + Launcher) into elements in strict FRONT-TO-BACK order
-    pub fn render_ui(
+    /// Render shader elements for Application Launcher
+    pub fn render_launcher_shaders(
         &self,
-        _renderer: &mut GlesRenderer,
+        screen_size: Size<i32, Logical>,
+    ) -> Vec<PixelShaderElement> {
+        let Some(pipe) = &self.shader_pipeline else {
+            return Vec::new();
+        };
+        if self.launcher.open_progress.value() > 0.01 {
+            self.launcher.render_shader_elements(pipe, screen_size, &self.colors)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Render shader elements for Quick Settings Drawer
+    pub fn render_drawer_shaders(
+        &self,
+        screen_size: Size<i32, Logical>,
+    ) -> Vec<PixelShaderElement> {
+        let Some(pipe) = &self.shader_pipeline else {
+            return Vec::new();
+        };
+        if self.drawer.open_progress.value() > 0.01 {
+            self.drawer.render_shader_elements(pipe, screen_size.w, self.bar.height, &self.colors)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Render shader elements for Top Status Bar
+    pub fn render_bar_shaders(
+        &self,
         screen_size: Size<i32, Logical>,
     ) -> Vec<PixelShaderElement> {
         let mut elements = Vec::new();
@@ -124,45 +154,18 @@ impl UiManager {
             return elements;
         };
 
-        // 1. APPLICATION LAUNCHER OVERLAY (Front-most overlay)
-        if self.launcher.open_progress.value() > 0.01 {
-            let launcher_elements = self.launcher.render_shader_elements(pipe, screen_size, &self.colors);
-            elements.extend(launcher_elements);
-        }
-
-        // 2. QUICK SETTINGS DRAWER OVERLAY (Front-to-back: Tiles -> Slider fills -> Slider bgs -> Card -> Shadow)
-        if self.drawer.open_progress.value() > 0.01 {
-            let drawer_elements = self.drawer.render_shader_elements(pipe, screen_size.w, self.bar.height, &self.colors);
-            elements.extend(drawer_elements);
-        }
-
-        // 3. TOP BAR (Front-to-back: Status chips -> Workspace pills -> Launcher button -> Divider -> Background)
         if self.bar.visible {
             let qs_w = 170;
             let qs_h = 24;
             let qs_x = screen_size.w - qs_w - 12;
             let qs_y = (self.bar.height - qs_h) / 2;
 
-            // A. Status chip: Wi-Fi active dot
-            let bat_w = 26;
-            let bat_h = 12;
-            let bat_x = qs_x + 12;
-            let dot_x = bat_x + bat_w + 10;
-            let dot_y = qs_y + (qs_h - 8) / 2;
-            let dot_rect = Rectangle::new(Point::from((dot_x, dot_y)), (8, 8).into());
-            elements.push(pipe.create_pill_element(dot_rect, 4.0, M3Colors::hex_to_rgba(&self.colors.primary), 1.0));
-
-            // B. Status chip: battery level mini-pill
-            let bat_y = qs_y + (qs_h - bat_h) / 2;
-            let bat_rect = Rectangle::new(Point::from((bat_x, bat_y)), (bat_w, bat_h).into());
-            elements.push(pipe.create_pill_element(bat_rect, 6.0, M3Colors::hex_to_rgba(&self.colors.primary), 0.9));
-
-            // C. Quick settings trigger pill (top right)
+            // 1. Quick settings trigger pill capsule (top right)
             let qs_rect = Rectangle::new(Point::from((qs_x, qs_y)), (qs_w, qs_h).into());
             let qs_color = M3Colors::hex_to_rgba(&self.colors.surface_container_high);
             elements.push(pipe.create_pill_element(qs_rect, 12.0, qs_color, 1.0));
 
-            // D. Workspace stretching pills (starting at x: 50)
+            // 2. Workspace stretching pills (starting at x: 50)
             let mut pill_x = 50;
             let pill_y = (self.bar.height - 12) / 2;
             for pill in &self.bar.workspace_pills {
@@ -177,7 +180,7 @@ impl UiManager {
                 pill_x += pw + 8;
             }
 
-            // E. App Launcher trigger pill & grid icon dots (top left, x: 8)
+            // 3. App Launcher trigger pill & grid icon dots (top left, x: 8)
             let launch_w = 34;
             let launch_h = 22;
             let launch_x = 8;
@@ -208,12 +211,12 @@ impl UiManager {
             };
             elements.push(pipe.create_pill_element(launch_rect, 11.0, launch_color, 1.0));
 
-            // F. Subtle divider line under status bar
+            // 4. Subtle divider line under status bar
             let line_rect = Rectangle::new(Point::from((0, self.bar.height - 1)), (screen_size.w, 1).into());
             let line_color = M3Colors::hex_to_rgba(&self.colors.outline_variant);
             elements.push(pipe.create_pill_element(line_rect, 0.0, line_color, 0.5));
 
-            // G. Top Bar background
+            // 5. Top Bar background
             let bar_rect = Rectangle::new(Point::from((0, 0)), (screen_size.w, self.bar.height).into());
             let bar_color = M3Colors::hex_to_rgba(&self.colors.surface_container);
             elements.push(pipe.create_pill_element(bar_rect, 0.0, bar_color, 0.96));
